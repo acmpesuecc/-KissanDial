@@ -1,15 +1,17 @@
 from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 import os
-from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, ServiceContext
+import pandas as pd
 from llama_index.llms.openai import OpenAI
+from twilio.rest import Client
+from jina import Document, Client as JinaClient
+from jina.embeddings.text import OpenAIEmbedding
+from jina.flow import Flow
+from jina import DocumentArray
 from llama_index.core.agent import ReActAgent
 from llama_index.core.tools import QueryEngineTool, ToolMetadata, FunctionTool
 from llama_index.core.agent import FunctionCallingAgentWorker
 from llama_index.core.memory import ChatMemoryBuffer
-import pandas as pd
-from twilio.rest import Client
-
 
 # Set up OpenAI API key
 os.environ["OPENAI_API_KEY"] = ""
@@ -18,12 +20,9 @@ to_say = 'Hi welcome to the Agricultural Assistant. How can I help you today?'
 
 app = Flask(__name__)
 
-# Load and index documents
-subsidy_docs = SimpleDirectoryReader(input_files=["main_subsidy_data.csv"]).load_data()
-subsidy_index = VectorStoreIndex.from_documents(subsidy_docs)
-
-# Create query engine
-subsidy_engine = subsidy_index.as_query_engine(similarity_top_k=6)
+# Initialize Jina Client and Flow
+jina_client = JinaClient(host='localhost:51001')  # Adjust the host as necessary
+flow = Flow().add(uses='docker://jinaai/llama3.2-90b')  # Ensure Llama 3.2 is properly deployed in a Docker container
 
 # Load the CSV file
 df = pd.read_csv("main_subsidy_data.csv")
@@ -34,12 +33,17 @@ def send_sms_with_subsidy_info(query: str) -> str:
     """
     print("INSIDE SEND SMS FUNCTION")
     print(f"Query: {query}")
-    results = subsidy_engine.query(query)
+    
+    # Use Jina to query for subsidies
+    doc = Document(text=query)
+    response = jina_client.post('/search', DocumentArray([doc]))
+    results = response[0].matches
+    
     print(f"Results: {results}")
     
     sms_body = "How to apply for relevant subsidies:\n\n"
-    # for subsidy in relevant_subsidies:
-    sms_body += f"{results}"
+    for result in results:
+        sms_body += f"{result.text}\n"
 
     account_sid = ''
     auth_token = ''
@@ -55,7 +59,7 @@ def send_sms_with_subsidy_info(query: str) -> str:
     except Exception as e:
         return f"Error sending SMS: {str(e)}"
 
-# Define tools
+# Define tools 
 subsidy_tool = QueryEngineTool(
     query_engine=subsidy_engine,
     metadata=ToolMetadata(
@@ -70,7 +74,8 @@ sms_tool = FunctionTool.from_defaults(
     description="Sends an SMS with 'how_to_apply' information for relevant subsidies.",
 )
 
-# Custom prompt for the agent
+
+# Custom prompt for the agent 
 CUSTOM_PROMPT = """
 You are a helpful conversational assistant. Below are the global details about the usecase which you need to abide by strictly:
 <global_details>
@@ -102,16 +107,14 @@ Remember to follow the below rules strictly:
 - Call relevant tools whether it be some api or a retrieval tool to fetch context needed to answer any query that the user might have. First decide if a tool call is needed in the thought and then call the appropriate tool. Respond to the user with a variant of 'let me check that for you' and then call the tool in the same turn.
 """
 
-# Initialize the agent
-llm = OpenAI(temperature=0, model="gpt-4o")
-memory = ChatMemoryBuffer.from_defaults(token_limit=2048)
-llm = OpenAI(temperature=0, model="gpt-4")
+# Initialize the agent (adjust the model to Llama 3.2)
+llm = OpenAI(temperature=0, model="llama-3.2")
 memory = ChatMemoryBuffer.from_defaults(token_limit=2048)
 agent_worker = FunctionCallingAgentWorker.from_tools(
-  [subsidy_tool, sms_tool], system_prompt=CUSTOM_PROMPT, 
-  memory=memory, llm=llm
-  verbose=True,
-  allow_parallel_tool_calls=False,
+    [subsidy_tool, sms_tool], system_prompt=CUSTOM_PROMPT, 
+    memory=memory, llm=llm
+    verbose=True,
+    allow_parallel_tool_calls=False,
 )
 agent = agent_worker.as_agent()
 
